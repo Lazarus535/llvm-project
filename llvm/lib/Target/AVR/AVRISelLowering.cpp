@@ -11,14 +11,21 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
+#include <iostream>
+
 #include "AVRISelLowering.h"
 
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/CodeGen/CallingConvLower.h"
+#include "llvm/CodeGen/ISDOpcodes.h"
 #include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineInstrBuilder.h"
 #include "llvm/CodeGen/MachineRegisterInfo.h"
 #include "llvm/CodeGen/SelectionDAG.h"
+#include "llvm/CodeGen/SelectionDAGNodes.h"
+#include "llvm/CodeGen/TargetCallingConv.h"
 #include "llvm/CodeGen/TargetLoweringObjectFileImpl.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -1305,6 +1312,109 @@ SDValue AVRTargetLowering::LowerCall(TargetLowering::CallLoweringInfo &CLI,
                          InVals);
 }
 
+// this function can be used to check if a i16 needs to be split
+// into 2 i8 registers
+template <typename RetArgVector>
+void checkForMissalignmentBug(const RetArgVector &InOut) {
+  bool Missaligned = false;
+  for(const auto &Arg: InOut) {
+    if(Arg.VT == MVT::i8) {
+      Missaligned = !Missaligned;
+    } else if(Arg.VT == MVT::i16) {
+      assert(!Missaligned && "A returned struct is not following the GCC calling convention");
+    }
+  }
+}
+
+// for returned values, check if i16 register splitting needs to be done
+int
+splitRegistersIfMissalignedCall(SmallVector<ISD::InputArg, 16> &Ins,
+                                SelectionDAG &DAG,
+                                const SDLoc &dl) {
+  
+  // total size of the returned values
+  int ByteLength = 0;
+  // use some i8 value in the returned values for padding later
+  ISD::InputArg InPadding = ISD::InputArg{};
+  bool PaddingInitialized = false;
+
+  // calculate total size of returned values
+  for(size_t i = 0; i < Ins.size(); i++) {
+    ISD::InputArg &In = Ins[i];
+
+    if(In.VT == MVT::i8) {
+      ByteLength += 1;
+      if(!PaddingInitialized) {
+        InPadding = In;
+        PaddingInitialized = true;
+      }
+    } else if(In.VT == MVT::i16) {
+      ByteLength += 2;
+    }
+  }
+
+  //copy over both vectors into temp vectors
+  SmallVector<ISD::InputArg, 16> InsTemp(Ins.begin(), Ins.end());
+
+  //clear original vectors
+  Ins.clear();
+  
+  size_t InsSize = InsTemp.size();
+  // indicates wheater the current i16 value would be missaligned
+  // i.e. not be stored in a i16 register, but needs to be split up
+  bool MissAligned = false;
+
+  for(size_t i = 0; i < InsSize; i++) {
+    const ISD::InputArg &In = InsTemp[i];
+
+    if(In.VT == MVT::i8) {
+      // just copy over both items
+      MissAligned = !MissAligned;
+
+      Ins.push_back(In);
+
+    } else if(In.VT == MVT::i16) {
+      if(MissAligned) {
+        // if a i16 value would not match a i16 register, spit it up
+
+        EVT OneRegVT = EVT::getIntegerVT(*DAG.getContext(), 8);
+
+        ISD::ArgFlagsTy Flags = In.Flags;
+        EVT ArgVT = In.ArgVT;
+
+        Ins.push_back(ISD::InputArg(Flags, MVT::i8,
+                                      ArgVT, /*isfixed=*/true, 0, 0));
+        Ins.push_back(ISD::InputArg(Flags, MVT::i8,
+                                      ArgVT, /*isfixed=*/true, 0, 0));
+      } else {
+        // if the i16 value IS corretly aligned, just copy over the items
+        Ins.push_back(In);
+      }
+    }
+  }
+
+  bool NeedsPadding = false;
+  int PaddingLength = 0;
+  // calculate how much padding is needed
+  // GCC extends struct returns to the next power of two size in bytes
+  // this also handels the special case for a single ret value
+  while((ByteLength != 0) && (ByteLength & (ByteLength - 1))) {
+    PaddingLength++;
+    ByteLength++;
+    NeedsPadding = true;
+  }
+
+  // actually add the padding
+  for(int i = 0; i < PaddingLength; i++) {
+    Ins.push_back(InPadding);
+  }
+
+  // reverse the two vectors so allocation starts at R25
+  std::reverse(Ins.begin(), Ins.end());
+
+  return PaddingLength;
+}
+
 /// Lower the result values of a call into the
 /// appropriate copies out of appropriate physical registers.
 ///
@@ -1318,23 +1428,77 @@ SDValue AVRTargetLowering::LowerCallResult(
   CCState CCInfo(CallConv, isVarArg, DAG.getMachineFunction(), RVLocs,
                  *DAG.getContext());
 
-  // Handle runtime calling convs.
-  auto CCFunction = CCAssignFnForReturn(CallConv);
-  CCInfo.AnalyzeCallResult(Ins, CCFunction);
+  //checkForMissalignmentBug(Ins);
 
-  if (CallConv != CallingConv::AVR_BUILTIN && RVLocs.size() > 1) {
-    // Reverse splitted return values to get the "big endian" format required
-    // to agree with the calling convention ABI.
-    std::reverse(RVLocs.begin(), RVLocs.end());
+  SmallVector<ISD::InputArg, 16> InsTemp(Ins.begin(), Ins.end());
+
+  int PaddingLength =
+  splitRegistersIfMissalignedCall(InsTemp, DAG, dl);
+
+  if(CallConv == CallingConv::AVR_BUILTIN) {
+    std::reverse(InsTemp.begin(), InsTemp.end());
   }
 
+  // Handle runtime calling convs.
+  auto CCFunction = CCAssignFnForReturn(CallConv);
+  CCInfo.AnalyzeCallResult(InsTemp, CCFunction);
+
+  SmallVector<CCValAssign, 16> RVLocsTemp{RVLocs.begin(), RVLocs.end()};
+  // unreverse register locations again
+  std::reverse(RVLocsTemp.begin(), RVLocsTemp.end());
+
+  int InsSize = Ins.size();
+  bool MissAligned = false;
+
   // Copy all of the result registers out of their specified physreg.
-  for (CCValAssign const &RVLoc : RVLocs) {
+  for (int i = PaddingLength, j = PaddingLength; i < InsSize; i++, j++) {
+    const ISD::InputArg &In = Ins[i];
+    CCValAssign &RVLoc = RVLocsTemp[j];
+
     Chain = DAG.getCopyFromReg(Chain, dl, RVLoc.getLocReg(), RVLoc.getValVT(),
-                               InFlag)
+                              InFlag)
                 .getValue(1);
     InFlag = Chain.getValue(2);
-    InVals.push_back(Chain.getValue(0));
+
+    if(In.VT == MVT::i8) {
+      // just copy over the value
+      MissAligned = !MissAligned;
+
+      InVals.push_back(Chain.getValue(0));
+
+    } else if(In.VT == MVT::i16) {
+      if(MissAligned) {
+        // here a split i16 register needs to be merged again
+        // here smth goes territly wrong
+
+        // contains the second i8 register for merging
+        CCValAssign &RVLoc1 = RVLocsTemp[j+1];
+
+        SDValue Lo = DAG.getNode(ISD::BITCAST, dl, MVT::i8, Chain.getValue(0));
+
+        Chain = DAG.getCopyFromReg(Chain, dl, RVLoc1.getLocReg(), RVLoc1.getValVT(),
+                                  InFlag)
+                    .getValue(1);
+        InFlag = Chain.getValue(2);
+
+        SDValue Hi = DAG.getNode(ISD::BITCAST, dl, MVT::i8, Chain.getValue(0));
+
+
+        SDValue Val = DAG.getNode(ISD::BUILD_PAIR, dl, In.ArgVT, Lo, Hi);
+        Val = DAG.getNode(ISD::BITCAST, dl, MVT::i16, Val);
+
+        InVals.push_back(Val);
+
+        j++;
+      } else {
+        // i16 register is aligned, so just copy over
+        InVals.push_back(Chain.getValue(0));
+      }
+    }
+  }
+
+  if(CallConv == CallingConv::AVR_BUILTIN) {
+    std::reverse(InVals.begin(), InVals.end());
   }
 
   return Chain;
@@ -1351,6 +1515,122 @@ CCAssignFn *AVRTargetLowering::CCAssignFnForReturn(CallingConv::ID CC) const {
   default:
     return RetCC_AVR;
   }
+}
+
+// this function splits an i16 register if it has to (according to GCC CC)
+// also introduced padding in certain cases
+// reverse registers to correctly allocate them for AVR
+bool
+splitRegistersIfMissalignedRet(SmallVector<ISD::OutputArg, 16> &Outs,
+                               SmallVector<SDValue, 16> &OutVals,
+                               SelectionDAG &DAG,
+                               const SDLoc &dl) {
+  
+  // total size of the returned values
+  int ByteLength = 0;
+  // use some i8 value in the returned values for padding later
+  ISD::OutputArg OutPadding = ISD::OutputArg{};
+  bool PaddingInitialized = false;
+
+  // calculate total size of returned values
+  for(size_t i = 0; i < Outs.size(); i++) {
+    ISD::OutputArg &Out = Outs[i];
+
+    if(Out.VT == MVT::i8) {
+      ByteLength += 1;
+      if(!PaddingInitialized) {
+        OutPadding = Out;
+        PaddingInitialized = true;
+      }
+    } else if(Out.VT == MVT::i16) {
+      ByteLength += 2;
+    }
+  }
+
+  //copy over both vectors into temp vectors
+  SmallVector<ISD::OutputArg, 16> OutsTemp(Outs.begin(), Outs.end());
+  SmallVector<SDValue, 16> OutValsTemp(OutVals.begin(), OutVals.end());
+
+  //clear original vectors
+  Outs.clear();
+  OutVals.clear();
+  
+  size_t OutsSize = OutsTemp.size();
+  // indicates wheater the current i16 value would be missaligned
+  // i.e. not be stored in a i16 register, but needs to be split up
+  bool MissAligned = false;
+
+  for(size_t i = 0; i < OutsSize; i++) {
+    const ISD::OutputArg &Out = OutsTemp[i];
+    const SDValue &OutVal = OutValsTemp[i];
+
+    if(Out.VT == MVT::i8) {
+      // just copy over both items
+      MissAligned = !MissAligned;
+
+      Outs.push_back(Out);
+      OutVals.push_back(OutVal);
+
+    } else if(Out.VT == MVT::i16) {
+      if(MissAligned) {
+        // if a i16 value would not match a i16 register, spit it up
+
+        SDValue Part0 = DAG.getNode(ISD::BITCAST, dl,
+                                    EVT::getIntegerVT(*DAG.getContext(),
+                                                      OutVal.getValueType().getSizeInBits()),
+                                    OutVal);
+
+        SDValue Part1 = DAG.getNode(ISD::EXTRACT_ELEMENT, dl,
+                                    MVT::i8, Part0, 
+                                    DAG.getIntPtrConstant(1, dl));
+        Part0 = DAG.getNode(ISD::EXTRACT_ELEMENT, dl,
+                            MVT::i8, Part0, 
+                            DAG.getIntPtrConstant(0, dl));
+
+        Part0 = DAG.getNode(ISD::BITCAST, dl, MVT::i8, Part0);
+        Part1 = DAG.getNode(ISD::BITCAST, dl, MVT::i8, Part1);
+        
+        OutVals.push_back(Part0);
+        OutVals.push_back(Part1);
+
+        ISD::ArgFlagsTy Flags = Out.Flags;
+        EVT ArgVT = Out.ArgVT;
+
+        Outs.push_back(ISD::OutputArg(Flags, Part0.getValueType(),
+                                      ArgVT, /*isfixed=*/true, 0, 0));
+        Outs.push_back(ISD::OutputArg(Flags, Part1.getValueType(),
+                                      ArgVT, /*isfixed=*/true, 0, 0));
+      } else {
+        // if the i16 value IS corretly aligned, just copy over the items
+        Outs.push_back(Out);
+        OutVals.push_back(OutVal);
+      }
+    }
+  }
+
+  bool NeedsPadding = false;
+  int PaddingLength = 0;
+  // calculate how much padding is needed
+  // GCC extends struct returns to the next power of two size in bytes
+  // this also handels the special case for a single ret value
+  while(((ByteLength != 0) && (ByteLength & (ByteLength - 1))) || ByteLength == 1) {
+    PaddingLength++;
+    ByteLength++;
+    NeedsPadding = true;
+  }
+
+  // actually add the padding
+  for(int i = 0; i < PaddingLength; i++) {
+    Outs.push_back(OutPadding);
+    SDValue PaddingVal = DAG.getConstant(0, dl, MVT::i8);
+    OutVals.push_back(PaddingVal);
+  }
+
+  // reverse the two vectors so allocation starts at R25
+  std::reverse(Outs.begin(), Outs.end());
+  std::reverse(OutVals.begin(), OutVals.end());
+
+  return NeedsPadding;
 }
 
 bool
@@ -1375,33 +1655,39 @@ AVRTargetLowering::LowerReturn(SDValue Chain, CallingConv::ID CallConv,
   // CCValAssign - represent the assignment of the return value to locations.
   SmallVector<CCValAssign, 16> RVLocs;
 
+  // uncomment to get diagnostics for problematic cases
+  // checkForMissalignmentBug(Outs);
+
+  SmallVector<ISD::OutputArg, 16> OutsTemp(Outs.begin(), Outs.end());
+  SmallVector<SDValue, 16> OutValsTemp(OutVals.begin(), OutVals.end());
+
+  bool NeedsPadding = 
+  splitRegistersIfMissalignedRet(OutsTemp, OutValsTemp, DAG, dl);
+
   // CCState - Info about the registers and stack slot.
   CCState CCInfo(CallConv, isVarArg, DAG.getMachineFunction(), RVLocs,
                  *DAG.getContext());
 
   // Analyze return values.
   auto CCFunction = CCAssignFnForReturn(CallConv);
-  CCInfo.AnalyzeReturn(Outs, CCFunction);
+  CCInfo.AnalyzeReturn(OutsTemp, CCFunction);
 
   // If this is the first return lowered for this function, add the regs to
   // the liveout set for the function.
   MachineFunction &MF = DAG.getMachineFunction();
   unsigned e = RVLocs.size();
 
-  // Reverse splitted return values to get the "big endian" format required
-  // to agree with the calling convention ABI.
-  if (e > 1) {
-    std::reverse(RVLocs.begin(), RVLocs.end());
-  }
-
   SDValue Flag;
   SmallVector<SDValue, 4> RetOps(1, Chain);
   // Copy the result values into the output registers.
   for (unsigned i = 0; i != e; ++i) {
+    // skip the first register (R25) when padding is used
+    if(NeedsPadding && i == 0) continue;
+
     CCValAssign &VA = RVLocs[i];
     assert(VA.isRegLoc() && "Can only return in registers!");
 
-    Chain = DAG.getCopyToReg(Chain, dl, VA.getLocReg(), OutVals[i], Flag);
+    Chain = DAG.getCopyToReg(Chain, dl, VA.getLocReg(), OutValsTemp[i], Flag);
 
     // Guarantee that all emitted copies are stuck together with flags.
     Flag = Chain.getValue(1);
